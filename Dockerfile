@@ -22,4 +22,4 @@ RUN apt-get update && apt-get install -y \
 COPY --from=builder /build/server /usr/local/bin/server
 
 EXPOSE 50051
-CMD ["server"]
+CMD ["/usr/local/bin/server"]
