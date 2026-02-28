@@ -35,12 +35,12 @@ jobs:
       - name: Build client (linux/amd64)
         run: |
           GOOS=linux GOARCH=amd64 CGO_ENABLED=0 \
-            go build -ldflags="-s -w" -o ffmpeg-proxy-client-linux-amd64 ./client
+            go build -ldflags="-s -w" -o ffmpeg-remote-client-linux-amd64 ./client
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ffmpeg-proxy-client-linux-amd64
+          files: ffmpeg-remote-client-linux-amd64
 
       - name: Set lowercase image name
         run: echo "IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV

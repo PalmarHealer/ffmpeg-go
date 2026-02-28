@@ -1,5 +1,5 @@
 services:
-  ffmpeg-proxy:
+  ffmpeg-remote:
     image: ghcr.io/palmarhealer/ffmpeg-go:latest
     restart: unless-stopped
     ports:

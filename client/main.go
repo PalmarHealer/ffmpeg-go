@@ -63,27 +63,27 @@ func loadConfigFile(path string) (Config, bool) {
 func loadConfig() Config {
 	cfg := defaultConfig()
 
-	// Priority 4 (lowest): /etc/ffmpeg-proxy/config.json
-	if c, ok := loadConfigFile("/etc/ffmpeg-proxy/config.json"); ok {
+	// Priority 4 (lowest): /etc/ffmpeg-remote/config.json
+	if c, ok := loadConfigFile("/etc/ffmpeg-remote/config.json"); ok {
 		cfg = mergeConfig(cfg, c)
 	}
 
-	// Priority 3: ~/.config/ffmpeg-proxy/config.json
+	// Priority 3: ~/.config/ffmpeg-remote/config.json
 	if home, err := os.UserHomeDir(); err == nil {
-		if c, ok := loadConfigFile(filepath.Join(home, ".config", "ffmpeg-proxy", "config.json")); ok {
+		if c, ok := loadConfigFile(filepath.Join(home, ".config", "ffmpeg-remote", "config.json")); ok {
 			cfg = mergeConfig(cfg, c)
 		}
 	}
 
-	// Priority 2: $FFMPEG_PROXY_CONFIG
-	if envPath := os.Getenv("FFMPEG_PROXY_CONFIG"); envPath != "" {
+	// Priority 2: $FFMPEG_REMOTE_CONFIG
+	if envPath := os.Getenv("FFMPEG_REMOTE_CONFIG"); envPath != "" {
 		if c, ok := loadConfigFile(envPath); ok {
 			cfg = mergeConfig(cfg, c)
 		}
 	}
 
-	// Priority 1 (highest): ./ffmpeg-proxy.json
-	if c, ok := loadConfigFile("ffmpeg-proxy.json"); ok {
+	// Priority 1 (highest): ./ffmpeg-remote.json
+	if c, ok := loadConfigFile("ffmpeg-remote.json"); ok {
 		cfg = mergeConfig(cfg, c)
 	}
 
@@ -99,7 +99,7 @@ func runFallback(bin string, args []string) {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			os.Exit(exitErr.ExitCode())
 		}
-		fmt.Fprintf(os.Stderr, "ffmpeg-proxy: fallback failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "ffmpeg-remote: fallback failed: %v\n", err)
 		os.Exit(1)
 	}
 	os.Exit(0)
@@ -274,7 +274,7 @@ func main() {
 		if err == nil {
 			return
 		}
-		fmt.Fprintf(os.Stderr, "ffmpeg-proxy: remote failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "ffmpeg-remote: remote failed: %v\n", err)
 		if cfg.Fallback == "never" {
 			os.Exit(1)
 		}

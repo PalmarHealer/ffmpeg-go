@@ -240,7 +240,7 @@ func main() {
 	grpcServer := grpc.NewServer()
 	pb.RegisterFFmpegProxyServer(grpcServer, &server{})
 
-	log.Printf("ffmpeg-proxy server listening on :%s (max_jobs=%d)", port, maxJobs)
+	log.Printf("ffmpeg-remote server listening on :%s (max_jobs=%d)", port, maxJobs)
 	if err := grpcServer.Serve(lis); err != nil {
 		log.Fatalf("serve: %v", err)
 	}

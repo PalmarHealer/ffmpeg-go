@@ -108,7 +108,7 @@ func TestDefaultConfig(t *testing.T) {
 // --- loadConfig priority ---
 
 func TestLoadConfigPriority(t *testing.T) {
-	// Create a temp dir and write a config file there, point FFMPEG_PROXY_CONFIG to it.
+	// Create a temp dir and write a config file there, point FFMPEG_REMOTE_CONFIG to it.
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.json")
 
@@ -118,9 +118,9 @@ func TestLoadConfigPriority(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Setenv("FFMPEG_PROXY_CONFIG", cfgPath)
+	t.Setenv("FFMPEG_REMOTE_CONFIG", cfgPath)
 
-	// Change working dir so ./ffmpeg-proxy.json doesn't interfere
+	// Change working dir so ./ffmpeg-remote.json doesn't interfere
 	orig, _ := os.Getwd()
 	defer os.Chdir(orig)
 	os.Chdir(dir)
@@ -142,12 +142,12 @@ func TestLoadConfigCurrentDirOverrides(t *testing.T) {
 	envData, _ := json.Marshal(envCfg)
 	envPath := filepath.Join(dir, "env-config.json")
 	os.WriteFile(envPath, envData, 0600)
-	t.Setenv("FFMPEG_PROXY_CONFIG", envPath)
+	t.Setenv("FFMPEG_REMOTE_CONFIG", envPath)
 
-	// Higher-priority ./ffmpeg-proxy.json
+	// Higher-priority ./ffmpeg-remote.json
 	localCfg := Config{ServerURL: "local-server:50051"}
 	localData, _ := json.Marshal(localCfg)
-	os.WriteFile(filepath.Join(dir, "ffmpeg-proxy.json"), localData, 0600)
+	os.WriteFile(filepath.Join(dir, "ffmpeg-remote.json"), localData, 0600)
 
 	orig, _ := os.Getwd()
 	defer os.Chdir(orig)

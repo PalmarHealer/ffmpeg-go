@@ -1,4 +1,4 @@
-# ffmpeg-proxy
+# ffmpeg-remote
 
 Transparent drop-in replacement for the `ffmpeg` binary that offloads transcoding to a remote server over gRPC. Everything streams in real-time — input is piped to the server as it's read, output is written back as ffmpeg produces it. Nothing touches disk on the server.
 
@@ -17,7 +17,7 @@ MAX_JOBS=4
 
 ```yaml
 services:
-  ffmpeg-proxy:
+  ffmpeg-remote:
     image: ghcr.io/palmarhealer/ffmpeg-go:latest
     restart: unless-stopped
     ports:
@@ -48,13 +48,13 @@ docker compose up -d
 sudo mv /usr/local/bin/ffmpeg /usr/local/bin/ffmpeg.real
 
 # Download the latest client and install it as ffmpeg
-sudo curl -fsSL https://github.com/PalmarHealer/ffmpeg-go/releases/latest/download/ffmpeg-proxy-client-linux-amd64 \
+sudo curl -fsSL https://github.com/PalmarHealer/ffmpeg-go/releases/latest/download/ffmpeg-remote-client-linux-amd64 \
   -o /usr/local/bin/ffmpeg && sudo chmod +x /usr/local/bin/ffmpeg
 ```
 
 ### 3. Configure the client
 
-Create `~/.config/ffmpeg-proxy/config.json`:
+Create `~/.config/ffmpeg-remote/config.json`:
 
 ```json
 {
@@ -82,10 +82,10 @@ The client loads and merges config files in this order (highest priority first):
 
 | Priority | Path |
 |----------|------|
-| 1 | `./ffmpeg-proxy.json` |
-| 2 | `$FFMPEG_PROXY_CONFIG` |
-| 3 | `~/.config/ffmpeg-proxy/config.json` |
-| 4 | `/etc/ffmpeg-proxy/config.json` |
+| 1 | `./ffmpeg-remote.json` |
+| 2 | `$FFMPEG_REMOTE_CONFIG` |
+| 3 | `~/.config/ffmpeg-remote/config.json` |
+| 4 | `/etc/ffmpeg-remote/config.json` |
 
 | Key | Default | Description |
 |-----|---------|-------------|
