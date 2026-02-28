@@ -1,0 +1,15 @@
+services:
+  ffmpeg-proxy:
+    image: ghcr.io/palmarhealer/ffmpeg-go:latest
+    restart: unless-stopped
+    ports:
+      - "50051:50051"
+    env_file:
+      - .env
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video]

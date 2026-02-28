@@ -1,0 +1,12 @@
+# Generated protobuf files (created by CI)
+proto/*.pb.go
+
+# Environment secrets
+.env
+
+# Build outputs
+ffmpeg-proxy-client-linux-amd64
+/server.exe
+/client.exe
+/server-bin
+/client-bin
