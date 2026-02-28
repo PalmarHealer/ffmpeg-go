@@ -113,18 +113,21 @@ func detectInputFile(args []string) string {
 	return ""
 }
 
-// detectOutputFile finds the last argument that doesn't start with -
+// detectOutputFile returns the last argument if it doesn't start with "-"
+// and is not the value of the -i flag.
 func detectOutputFile(args []string) string {
-	for i := len(args) - 1; i >= 0; i-- {
-		if !strings.HasPrefix(args[i], "-") {
-			// Make sure it's not the input file (argument after -i)
-			if i > 0 && args[i-1] == "-i" {
-				continue
-			}
-			return args[i]
-		}
+	if len(args) == 0 {
+		return ""
 	}
-	return ""
+	last := args[len(args)-1]
+	if strings.HasPrefix(last, "-") {
+		return ""
+	}
+	// The last arg is a value of -i, not an output file
+	if len(args) >= 2 && args[len(args)-2] == "-i" {
+		return ""
+	}
+	return last
 }
 
 // sanitizeArgs replaces the input file path with pipe:0 and output file with pipe:1

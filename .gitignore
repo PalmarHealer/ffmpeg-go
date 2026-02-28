@@ -10,3 +10,5 @@ ffmpeg-proxy-client-linux-amd64
 /client.exe
 /server-bin
 /client-bin
+/.idea/
+/.claude/

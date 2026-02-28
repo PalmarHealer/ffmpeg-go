@@ -1,0 +1,33 @@
+name: Test
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install protoc
+        run: |
+          PROTOC_VERSION=25.3
+          curl -L -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          unzip /tmp/protoc.zip -d /tmp/protoc
+          echo "/tmp/protoc/bin" >> $GITHUB_PATH
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
+
+      - name: Generate protobuf
+        run: protoc --go_out=. --go-grpc_out=. proto/ffmpeg.proto
+
+      - name: Test
+        run: go test ./...
