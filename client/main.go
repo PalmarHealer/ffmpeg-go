@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -98,6 +99,7 @@ func runFallback(bin string, args []string) {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			os.Exit(exitErr.ExitCode())
 		}
+		fmt.Fprintf(os.Stderr, "ffmpeg-proxy: fallback failed: %v\n", err)
 		os.Exit(1)
 	}
 	os.Exit(0)
@@ -176,7 +178,7 @@ func runRemote(cfg Config, args []string) error {
 	defer conn.Close()
 
 	client := pb.NewFFmpegProxyClient(conn)
-	stream, err := client.Process(nil)
+	stream, err := client.Process(context.Background())
 	if err != nil {
 		return fmt.Errorf("open stream: %w", err)
 	}
