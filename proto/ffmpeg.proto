@@ -28,9 +28,10 @@ message FileChunk {
 
 message ProcessResponse {
   oneof payload {
-    bytes         chunk      = 1;  // pipe mode stdout (unchanged)
-    ProcessResult result     = 2;  // final exit code + stderr (unchanged)
-    FileChunk     file_chunk = 3;  // exec mode: named file segment
+    bytes         chunk        = 1;  // pipe mode stdout
+    ProcessResult result       = 2;  // final exit code + stderr
+    FileChunk     file_chunk   = 3;  // exec mode: named file segment
+    bytes         stderr_chunk = 4;  // live stderr relay (both modes)
   }
 }
 

@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -13,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/fsnotify/fsnotify"
@@ -86,7 +86,7 @@ func (s *server) Process(stream pb.FFmpegProxy_ProcessServer) error {
 	atomic.AddInt64(&activeJobs, 1)
 	defer atomic.AddInt64(&activeJobs, -1)
 
-	// 5. Build command – args[0] is the binary, args[1:] are its arguments
+	// 5. Build command
 	cmd := exec.CommandContext(ctx, cmd0, args[1:]...)
 
 	stdinPipe, err := cmd.StdinPipe()
@@ -97,231 +97,26 @@ func (s *server) Process(stream pb.FFmpegProxy_ProcessServer) error {
 	if err != nil {
 		return status.Errorf(codes.Internal, "stdout pipe: %v", err)
 	}
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = &stderrBuf
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return status.Errorf(codes.Internal, "stderr pipe: %v", err)
+	}
 
 	if err := cmd.Start(); err != nil {
 		return status.Errorf(codes.Internal, "start ffmpeg: %v", err)
+	}
+
+	// Mutex to serialize stream.Send across stdout and stderr goroutines
+	var sendMu sync.Mutex
+	safeSend := func(resp *pb.ProcessResponse) error {
+		sendMu.Lock()
+		defer sendMu.Unlock()
+		return stream.Send(resp)
 	}
 
 	// 6. Goroutine: stream.Recv() → stdin pipe
-	// If stdin write fails (ffmpeg exited early), we stop feeding but do NOT
-	// treat it as a fatal stream error – let stdout drain and report exit code.
-	recvDone := make(chan struct{})
-	recvClientErr := make(chan error, 1) // only set on gRPC recv failure
-	go func() {
-		defer close(recvDone)
-		defer stdinPipe.Close()
-		for {
-			req, err := stream.Recv()
-			if err == io.EOF {
-				return
-			}
-			if err != nil {
-				recvClientErr <- err
-				cancel()
-				return
-			}
-			chunk, ok := req.Payload.(*pb.ProcessRequest_Chunk)
-			if !ok {
-				continue
-			}
-			if _, err := stdinPipe.Write(chunk.Chunk); err != nil {
-				// FFmpeg closed its stdin (exited early); drain remaining
-				// stream bytes so the client's send goroutine unblocks.
-				for {
-					_, e := stream.Recv()
-					if e != nil {
-						break
-					}
-				}
-				return
-			}
-		}
-	}()
-
-	// 7. Goroutine: stdout pipe → stream.Send(chunk)
-	sendErr := make(chan error, 1)
-	go func() {
-		buf := make([]byte, chunkSize)
-		for {
-			n, err := stdoutPipe.Read(buf)
-			if n > 0 {
-				chunk := make([]byte, n)
-				copy(chunk, buf[:n])
-				if sendErr2 := stream.Send(&pb.ProcessResponse{
-					Payload: &pb.ProcessResponse_Chunk{Chunk: chunk},
-				}); sendErr2 != nil {
-					sendErr <- sendErr2
-					cancel()
-					return
-				}
-			}
-			if err == io.EOF {
-				sendErr <- nil
-				return
-			}
-			if err != nil {
-				sendErr <- err
-				cancel()
-				return
-			}
-		}
-	}()
-
-	// Wait for stdout to finish (primary signal that ffmpeg is done writing)
-	if err := <-sendErr; err != nil {
-		<-recvDone
-		return status.Errorf(codes.Internal, "send: %v", err)
-	}
-
-	// Check for client-side recv error
-	select {
-	case err := <-recvClientErr:
-		<-recvDone
-		return status.Errorf(codes.Internal, "recv: %v", err)
-	default:
-	}
-
-	<-recvDone
-
-	// 8. Wait for ffmpeg to finish
-	waitErr := cmd.Wait()
-	exitCode := int32(0)
-	if waitErr != nil {
-		if exitErr, ok := waitErr.(*exec.ExitError); ok {
-			exitCode = int32(exitErr.ExitCode())
-		} else {
-			exitCode = 1
-		}
-	}
-
-	// Send result
-	return stream.Send(&pb.ProcessResponse{
-		Payload: &pb.ProcessResponse_Result{
-			Result: &pb.ProcessResult{
-				ExitCode: exitCode,
-				Stderr:   stderrBuf.String(),
-			},
-		},
-	})
-}
-
-// sendFileToStream reads path and sends it as a sequence of FileChunk messages.
-// The final message has Eof=true and no data. Updates sentFiles with the basename.
-// If the file is empty (e.g. caught by a premature Create event on Windows before
-// FFmpeg has written any data) the send is skipped and sentFiles is not updated.
-func sendFileToStream(stream pb.FFmpegProxy_ProcessServer, path string, sentFiles map[string]bool) {
-	filename := filepath.Base(path)
-	f, err := os.Open(path)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-
-	buf := make([]byte, chunkSize)
-	sentAny := false
-	for {
-		n, err := f.Read(buf)
-		if n > 0 {
-			sentAny = true
-			chunk := make([]byte, n)
-			copy(chunk, buf[:n])
-			if sendErr := stream.Send(&pb.ProcessResponse{
-				Payload: &pb.ProcessResponse_FileChunk{
-					FileChunk: &pb.FileChunk{
-						Filename: filename,
-						Data:     chunk,
-						Eof:      false,
-					},
-				},
-			}); sendErr != nil {
-				return
-			}
-		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return
-		}
-	}
-
-	// Skip empty files – FFmpeg may not have written anything yet (Windows Create event race)
-	if !sentAny {
-		return
-	}
-
-	// EOF marker
-	stream.Send(&pb.ProcessResponse{ //nolint:errcheck
-		Payload: &pb.ProcessResponse_FileChunk{
-			FileChunk: &pb.FileChunk{
-				Filename: filename,
-				Eof:      true,
-			},
-		},
-	})
-	sentFiles[filename] = true
-}
-
-// processExec handles HLS / multi-file output mode.
-// FFmpeg writes to a temp dir; fsnotify relays completed files back over gRPC.
-func (s *server) processExec(stream pb.FFmpegProxy_ProcessServer, args []string) error {
-	// 1. Create temp dir
-	tmpDir, err := os.MkdirTemp("", "ffmpeg-exec-*")
-	if err != nil {
-		return status.Errorf(codes.Internal, "mkdirtemp: %v", err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	// 2. Validate whitelist (defensive; already checked in Process)
-	if args[0] != "ffmpeg" && args[0] != "ffprobe" {
-		return status.Error(codes.PermissionDenied, "only ffmpeg and ffprobe are allowed")
-	}
-
-	// 3. Context + job counter
-	ctx, cancel := context.WithCancel(stream.Context())
-	defer cancel()
-	atomic.AddInt64(&activeJobs, 1)
-	defer atomic.AddInt64(&activeJobs, -1)
-
-	// 4. Build command
-	var stderrBuf bytes.Buffer
-	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-	cmd.Dir = tmpDir
-	stdinPipe, err := cmd.StdinPipe()
-	if err != nil {
-		return status.Errorf(codes.Internal, "stdin pipe: %v", err)
-	}
-	cmd.Stdout = io.Discard
-	cmd.Stderr = &stderrBuf
-
-	if err := cmd.Start(); err != nil {
-		return status.Errorf(codes.Internal, "start ffmpeg: %v", err)
-	}
-
-	// 5. Start fsnotify watcher
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		cancel()
-		cmd.Wait() //nolint:errcheck
-		return status.Errorf(codes.Internal, "fsnotify: %v", err)
-	}
-	defer watcher.Close()
-
-	if err := watcher.Add(tmpDir); err != nil {
-		cancel()
-		cmd.Wait() //nolint:errcheck
-		return status.Errorf(codes.Internal, "watcher.Add: %v", err)
-	}
-
-	// Channels
 	recvDone := make(chan struct{})
 	recvClientErr := make(chan error, 1)
-	ffmpegDone := make(chan struct{})
-	watcherDone := make(chan struct{})
-
-	// 6. Goroutine A: recv input → stdinPipe
 	go func() {
 		defer close(recvDone)
 		defer stdinPipe.Close()
@@ -352,7 +147,237 @@ func (s *server) processExec(stream pb.FFmpegProxy_ProcessServer, args []string)
 		}
 	}()
 
-	// 7. Goroutine B: watcher relay → stream.Send(FileChunk)
+	// 7. Goroutine: stdout pipe → stream.Send(chunk)
+	stdoutDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, chunkSize)
+		for {
+			n, err := stdoutPipe.Read(buf)
+			if n > 0 {
+				chunk := make([]byte, n)
+				copy(chunk, buf[:n])
+				if sendErr := safeSend(&pb.ProcessResponse{
+					Payload: &pb.ProcessResponse_Chunk{Chunk: chunk},
+				}); sendErr != nil {
+					stdoutDone <- sendErr
+					cancel()
+					return
+				}
+			}
+			if err == io.EOF {
+				stdoutDone <- nil
+				return
+			}
+			if err != nil {
+				stdoutDone <- err
+				cancel()
+				return
+			}
+		}
+	}()
+
+	// 8. Goroutine: stderr pipe → stream.Send(StderrChunk) for live progress
+	stderrDone := make(chan struct{})
+	go func() {
+		defer close(stderrDone)
+		buf := make([]byte, chunkSize)
+		for {
+			n, err := stderrPipe.Read(buf)
+			if n > 0 {
+				chunk := make([]byte, n)
+				copy(chunk, buf[:n])
+				safeSend(&pb.ProcessResponse{ //nolint:errcheck
+					Payload: &pb.ProcessResponse_StderrChunk{StderrChunk: chunk},
+				})
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Wait for stdout (signals ffmpeg has finished writing output)
+	if err := <-stdoutDone; err != nil {
+		<-recvDone
+		<-stderrDone
+		return status.Errorf(codes.Internal, "send: %v", err)
+	}
+
+	// Wait for stderr relay to flush
+	<-stderrDone
+
+	select {
+	case err := <-recvClientErr:
+		<-recvDone
+		return status.Errorf(codes.Internal, "recv: %v", err)
+	default:
+	}
+
+	<-recvDone
+
+	waitErr := cmd.Wait()
+	exitCode := int32(0)
+	if waitErr != nil {
+		if exitErr, ok := waitErr.(*exec.ExitError); ok {
+			exitCode = int32(exitErr.ExitCode())
+		} else {
+			exitCode = 1
+		}
+	}
+
+	return stream.Send(&pb.ProcessResponse{
+		Payload: &pb.ProcessResponse_Result{
+			Result: &pb.ProcessResult{ExitCode: exitCode},
+		},
+	})
+}
+
+// sendFileToStream reads path in chunks and sends it as FileChunk messages via send.
+// The final message has Eof=true and no data. Updates sentFiles with the basename.
+// If the file is empty (premature Create event on Windows) the send is skipped.
+func sendFileToStream(send func(*pb.ProcessResponse) error, path string, sentFiles map[string]bool) {
+	filename := filepath.Base(path)
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	buf := make([]byte, chunkSize)
+	sentAny := false
+	for {
+		n, err := f.Read(buf)
+		if n > 0 {
+			sentAny = true
+			chunk := make([]byte, n)
+			copy(chunk, buf[:n])
+			if sendErr := send(&pb.ProcessResponse{
+				Payload: &pb.ProcessResponse_FileChunk{
+					FileChunk: &pb.FileChunk{
+						Filename: filename,
+						Data:     chunk,
+						Eof:      false,
+					},
+				},
+			}); sendErr != nil {
+				return
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return
+		}
+	}
+
+	if !sentAny {
+		return
+	}
+
+	send(&pb.ProcessResponse{ //nolint:errcheck
+		Payload: &pb.ProcessResponse_FileChunk{
+			FileChunk: &pb.FileChunk{
+				Filename: filename,
+				Eof:      true,
+			},
+		},
+	})
+	sentFiles[filename] = true
+}
+
+// processExec handles HLS / multi-file output mode.
+func (s *server) processExec(stream pb.FFmpegProxy_ProcessServer, args []string) error {
+	tmpDir, err := os.MkdirTemp("", "ffmpeg-exec-*")
+	if err != nil {
+		return status.Errorf(codes.Internal, "mkdirtemp: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	if args[0] != "ffmpeg" && args[0] != "ffprobe" {
+		return status.Error(codes.PermissionDenied, "only ffmpeg and ffprobe are allowed")
+	}
+
+	ctx, cancel := context.WithCancel(stream.Context())
+	defer cancel()
+	atomic.AddInt64(&activeJobs, 1)
+	defer atomic.AddInt64(&activeJobs, -1)
+
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	cmd.Dir = tmpDir
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		return status.Errorf(codes.Internal, "stdin pipe: %v", err)
+	}
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return status.Errorf(codes.Internal, "stderr pipe: %v", err)
+	}
+	cmd.Stdout = io.Discard
+
+	if err := cmd.Start(); err != nil {
+		return status.Errorf(codes.Internal, "start ffmpeg: %v", err)
+	}
+
+	// Mutex to serialize sends from watcher goroutine and stderr goroutine
+	var sendMu sync.Mutex
+	safeSend := func(resp *pb.ProcessResponse) error {
+		sendMu.Lock()
+		defer sendMu.Unlock()
+		return stream.Send(resp)
+	}
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		cancel()
+		cmd.Wait() //nolint:errcheck
+		return status.Errorf(codes.Internal, "fsnotify: %v", err)
+	}
+	defer watcher.Close()
+
+	if err := watcher.Add(tmpDir); err != nil {
+		cancel()
+		cmd.Wait() //nolint:errcheck
+		return status.Errorf(codes.Internal, "watcher.Add: %v", err)
+	}
+
+	recvDone := make(chan struct{})
+	recvClientErr := make(chan error, 1)
+	ffmpegDone := make(chan struct{})
+	watcherDone := make(chan struct{})
+	stderrDone := make(chan struct{})
+
+	// Goroutine A: recv input → stdinPipe
+	go func() {
+		defer close(recvDone)
+		defer stdinPipe.Close()
+		for {
+			req, err := stream.Recv()
+			if err == io.EOF {
+				return
+			}
+			if err != nil {
+				recvClientErr <- err
+				cancel()
+				return
+			}
+			chunk, ok := req.Payload.(*pb.ProcessRequest_Chunk)
+			if !ok {
+				continue
+			}
+			if _, err := stdinPipe.Write(chunk.Chunk); err != nil {
+				for {
+					_, e := stream.Recv()
+					if e != nil {
+						break
+					}
+				}
+				return
+			}
+		}
+	}()
+
+	// Goroutine B: watcher relay → safeSend(FileChunk)
 	sentFiles := make(map[string]bool)
 	go func() {
 		defer close(watcherDone)
@@ -368,19 +393,13 @@ func (s *server) processExec(stream pb.FFmpegProxy_ProcessServer, args []string)
 
 				if isMP4 && (event.Has(fsnotify.Create) || event.Has(fsnotify.Rename)) {
 					if !sentFiles[name] {
-						sendFileToStream(stream, event.Name, sentFiles)
+						sendFileToStream(safeSend, event.Name, sentFiles)
 					}
 				} else if isM3U8 && (event.Has(fsnotify.Write) || event.Has(fsnotify.Create)) {
-					// m3u8 sent on every update; content changes
-					sendFileToStream(stream, event.Name, sentFiles)
+					sendFileToStream(safeSend, event.Name, sentFiles)
 				}
 
 			case <-ffmpegDone:
-				// Final scan: send all mp4 and m3u8 files.
-				// MP4s are always re-sent regardless of sentFiles: on Windows,
-				// fsnotify Create fires before FFmpeg has written data, so the
-				// earlier watcher-triggered send may have been empty/partial.
-				// The client uses os.Create (truncate) so duplicate sends are safe.
 				entries, _ := os.ReadDir(tmpDir)
 				for _, e := range entries {
 					if e.IsDir() {
@@ -389,7 +408,7 @@ func (s *server) processExec(stream pb.FFmpegProxy_ProcessServer, args []string)
 					name := e.Name()
 					path := filepath.Join(tmpDir, name)
 					if strings.HasSuffix(name, ".mp4") || strings.HasSuffix(name, ".m3u8") {
-						sendFileToStream(stream, path, sentFiles)
+						sendFileToStream(safeSend, path, sentFiles)
 					}
 				}
 				return
@@ -400,20 +419,39 @@ func (s *server) processExec(stream pb.FFmpegProxy_ProcessServer, args []string)
 		}
 	}()
 
-	// 8. Wait for input, then FFmpeg, then watcher
+	// Goroutine C: stderr pipe → safeSend(StderrChunk) for live progress
+	go func() {
+		defer close(stderrDone)
+		buf := make([]byte, chunkSize)
+		for {
+			n, err := stderrPipe.Read(buf)
+			if n > 0 {
+				chunk := make([]byte, n)
+				copy(chunk, buf[:n])
+				safeSend(&pb.ProcessResponse{ //nolint:errcheck
+					Payload: &pb.ProcessResponse_StderrChunk{StderrChunk: chunk},
+				})
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	// Wait for all input, then stderr EOF (= ffmpeg exited), then reap
 	<-recvDone
+	<-stderrDone
+
 	waitErr := cmd.Wait()
 	close(ffmpegDone)
 	<-watcherDone
 
-	// Check for client recv error
 	select {
 	case err := <-recvClientErr:
 		return status.Errorf(codes.Internal, "recv: %v", err)
 	default:
 	}
 
-	// 9. Determine exit code and send result
 	exitCode := int32(0)
 	if waitErr != nil {
 		if exitErr, ok := waitErr.(*exec.ExitError); ok {
@@ -425,10 +463,7 @@ func (s *server) processExec(stream pb.FFmpegProxy_ProcessServer, args []string)
 
 	return stream.Send(&pb.ProcessResponse{
 		Payload: &pb.ProcessResponse_Result{
-			Result: &pb.ProcessResult{
-				ExitCode: exitCode,
-				Stderr:   stderrBuf.String(),
-			},
+			Result: &pb.ProcessResult{ExitCode: exitCode},
 		},
 	})
 }

@@ -345,7 +345,6 @@ func runRemoteExec(cfg Config, args []string) error {
 	}()
 
 	var lastExitCode int32
-	var lastStderr string
 	for {
 		resp, err := stream.Recv()
 		if err == io.EOF {
@@ -355,6 +354,8 @@ func runRemoteExec(cfg Config, args []string) error {
 			return fmt.Errorf("recv: %w", err)
 		}
 		switch p := resp.Payload.(type) {
+		case *pb.ProcessResponse_StderrChunk:
+			os.Stderr.Write(p.StderrChunk) //nolint:errcheck
 		case *pb.ProcessResponse_FileChunk:
 			fc := p.FileChunk
 			name := filepath.Base(fc.Filename) // ensure basename only
@@ -380,7 +381,6 @@ func runRemoteExec(cfg Config, args []string) error {
 			}
 		case *pb.ProcessResponse_Result:
 			lastExitCode = p.Result.ExitCode
-			lastStderr = p.Result.Stderr
 		}
 	}
 
@@ -388,9 +388,6 @@ func runRemoteExec(cfg Config, args []string) error {
 		return fmt.Errorf("send: %w", err)
 	}
 
-	if lastStderr != "" {
-		fmt.Fprint(os.Stderr, lastStderr)
-	}
 	if lastExitCode != 0 {
 		os.Exit(int(lastExitCode))
 	}
@@ -487,7 +484,6 @@ func runRemote(cfg Config, args []string) error {
 
 	// Receive responses
 	var lastExitCode int32
-	var lastStderr string
 	for {
 		resp, err := stream.Recv()
 		if err == io.EOF {
@@ -497,13 +493,14 @@ func runRemote(cfg Config, args []string) error {
 			return fmt.Errorf("recv: %w", err)
 		}
 		switch p := resp.Payload.(type) {
+		case *pb.ProcessResponse_StderrChunk:
+			os.Stderr.Write(p.StderrChunk) //nolint:errcheck
 		case *pb.ProcessResponse_Chunk:
 			if _, err := outF.Write(p.Chunk); err != nil {
 				return fmt.Errorf("write output: %w", err)
 			}
 		case *pb.ProcessResponse_Result:
 			lastExitCode = p.Result.ExitCode
-			lastStderr = p.Result.Stderr
 		}
 	}
 
@@ -512,9 +509,6 @@ func runRemote(cfg Config, args []string) error {
 		return fmt.Errorf("send: %w", err)
 	}
 
-	if lastStderr != "" {
-		fmt.Fprint(os.Stderr, lastStderr)
-	}
 	if lastExitCode != 0 {
 		os.Exit(int(lastExitCode))
 	}
