@@ -12,12 +12,21 @@ COPY . .
 RUN protoc --go_out=. --go-grpc_out=. proto/ffmpeg.proto
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/server ./server
 
-# Runtime: ffmpeg with NVIDIA support
+# Runtime: jellyfin-ffmpeg for full NVENC/VA-API/CUDA hardware support
 FROM nvidia/cuda:12.3.1-runtime-ubuntu22.04
 
-RUN apt-get update && apt-get install -y \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl ca-certificates && \
+    curl -fsSL https://repo.jellyfin.org/ubuntu/jellyfin_team.gpg.key \
+        | gpg --dearmor -o /usr/share/keyrings/jellyfin.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/jellyfin.gpg] \
+        https://repo.jellyfin.org/ubuntu jammy main" \
+        > /etc/apt/sources.list.d/jellyfin.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
+        jellyfin-ffmpeg7 && \
+    ln -s /usr/lib/jellyfin-ffmpeg/ffmpeg /usr/local/bin/ffmpeg && \
+    ln -s /usr/lib/jellyfin-ffmpeg/ffprobe /usr/local/bin/ffprobe && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /out/server /usr/local/bin/server
 
