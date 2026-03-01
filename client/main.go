@@ -132,7 +132,9 @@ func detectOutputFile(args []string) string {
 	return last
 }
 
-// sanitizeArgs replaces the input file path with pipe:0 and output file with pipe:1
+// sanitizeArgs replaces the input file path with pipe:0 and output file with pipe:1.
+// For muxers that require seekable output (mp4, mov, …) it injects
+// -movflags +frag_keyframe+empty_moov so the stream can be written to a pipe.
 func sanitizeArgs(args []string, inputFile, outputFile string) []string {
 	result := make([]string, len(args))
 	copy(result, args)
@@ -143,7 +145,28 @@ func sanitizeArgs(args []string, inputFile, outputFile string) []string {
 			result[i] = "pipe:1"
 		}
 	}
+	if pipeFormatNeedsFragFlags(result) {
+		last := result[len(result)-1]
+		result = append(result[:len(result)-1], "-movflags", "+frag_keyframe+empty_moov", last)
+	}
 	return result
+}
+
+// pipeFormatNeedsFragFlags reports whether args use a seekable-only muxer
+// (mp4, mov, …) with pipe:1 as output, requiring fragmentation flags.
+func pipeFormatNeedsFragFlags(args []string) bool {
+	if len(args) == 0 || args[len(args)-1] != "pipe:1" {
+		return false
+	}
+	for i, a := range args {
+		if a == "-f" && i+1 < len(args) {
+			switch args[i+1] {
+			case "mp4", "mov", "m4v", "3gp", "3g2":
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // isHLSMode returns true when args contain -f hls.
