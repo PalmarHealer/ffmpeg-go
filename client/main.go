@@ -146,7 +146,240 @@ func sanitizeArgs(args []string, inputFile, outputFile string) []string {
 	return result
 }
 
+// isHLSMode returns true when args contain -f hls.
+func isHLSMode(args []string) bool {
+	for i, a := range args {
+		if a == "-f" && i+1 < len(args) && args[i+1] == "hls" {
+			return true
+		}
+	}
+	return false
+}
+
+// extractOutputDir returns the directory where HLS output files should be written.
+// It prefers the directory of -hls_segment_filename, falling back to the directory
+// of the last non-flag argument (the m3u8 playlist path).
+func extractOutputDir(args []string) string {
+	for i, a := range args {
+		if a == "-hls_segment_filename" && i+1 < len(args) {
+			path := strings.TrimPrefix(args[i+1], "file:")
+			return filepath.Dir(path)
+		}
+	}
+	// Fall back to dir of last non-flag arg (playlist)
+	for i := len(args) - 1; i >= 0; i-- {
+		if !strings.HasPrefix(args[i], "-") {
+			if i == 0 || args[i-1] != "-i" {
+				path := strings.TrimPrefix(args[i], "file:")
+				return filepath.Dir(path)
+			}
+		}
+	}
+	return "."
+}
+
+// sanitizeHLSArgs transforms args for exec mode on the server:
+//   - replaces -i value with pipe:0 (strips file: URI prefix)
+//   - strips directory from -hls_segment_filename value (server uses cmd.Dir)
+//   - strips directory from -hls_fmp4_init_filename if absolute
+//   - strips directory from the final playlist argument
+//
+// Returns args with "ffmpeg" prepended as args[0].
+func sanitizeHLSArgs(args []string) []string {
+	result := make([]string, len(args))
+	copy(result, args)
+
+	// Find the index of the last non-flag, non-i-value arg (the playlist output)
+	lastOutputIdx := -1
+	for i := len(result) - 1; i >= 0; i-- {
+		if !strings.HasPrefix(result[i], "-") {
+			if i == 0 || result[i-1] != "-i" {
+				lastOutputIdx = i
+				break
+			}
+		}
+	}
+
+	for i := 0; i < len(result); i++ {
+		switch result[i] {
+		case "-i":
+			if i+1 < len(result) {
+				i++
+				result[i] = "pipe:0"
+			}
+		case "-hls_segment_filename":
+			if i+1 < len(result) {
+				i++
+				val := strings.TrimPrefix(result[i], "file:")
+				result[i] = filepath.Base(val)
+			}
+		case "-hls_fmp4_init_filename":
+			if i+1 < len(result) {
+				i++
+				val := strings.TrimPrefix(result[i], "file:")
+				if filepath.IsAbs(val) {
+					result[i] = filepath.Base(val)
+				} else {
+					result[i] = val
+				}
+			}
+		}
+	}
+
+	// Strip dir from the playlist output arg
+	if lastOutputIdx >= 0 {
+		val := strings.TrimPrefix(result[lastOutputIdx], "file:")
+		result[lastOutputIdx] = filepath.Base(val)
+	}
+
+	return append([]string{"ffmpeg"}, result...)
+}
+
+// runRemoteExec handles HLS / exec mode: FFmpeg writes to a temp dir on the server
+// and each output file is streamed back as FileChunk messages.
+func runRemoteExec(cfg Config, args []string) error {
+	inputFile := detectInputFile(args)
+	if inputFile == "" {
+		return fmt.Errorf("no input file detected (-i flag missing)")
+	}
+
+	outputDir := extractOutputDir(args)
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return fmt.Errorf("mkdir output dir: %w", err)
+	}
+
+	// Strip file: URI prefix when opening locally
+	actualInputPath := strings.TrimPrefix(inputFile, "file:")
+	inF, err := os.Open(actualInputPath)
+	if err != nil {
+		return fmt.Errorf("open input: %w", err)
+	}
+	defer inF.Close()
+
+	conn, err := grpc.Dial(cfg.ServerURL, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return fmt.Errorf("grpc dial: %w", err)
+	}
+	defer conn.Close()
+
+	client := pb.NewFFmpegProxyClient(conn)
+	stream, err := client.Process(context.Background())
+	if err != nil {
+		return fmt.Errorf("open stream: %w", err)
+	}
+
+	sanitized := sanitizeHLSArgs(args)
+
+	// Send goroutine: meta first, then input file in chunks
+	sendErrCh := make(chan error, 1)
+	go func() {
+		defer stream.CloseSend()
+
+		if err := stream.Send(&pb.ProcessRequest{
+			Payload: &pb.ProcessRequest_Meta{
+				Meta: &pb.ProcessMeta{
+					Token:    cfg.Token,
+					Args:     sanitized,
+					ExecMode: true,
+				},
+			},
+		}); err != nil {
+			sendErrCh <- err
+			return
+		}
+
+		buf := make([]byte, chunkSize)
+		for {
+			n, err := inF.Read(buf)
+			if n > 0 {
+				chunk := make([]byte, n)
+				copy(chunk, buf[:n])
+				if sendErr := stream.Send(&pb.ProcessRequest{
+					Payload: &pb.ProcessRequest_Chunk{Chunk: chunk},
+				}); sendErr != nil {
+					sendErrCh <- sendErr
+					return
+				}
+			}
+			if err == io.EOF {
+				sendErrCh <- nil
+				return
+			}
+			if err != nil {
+				sendErrCh <- err
+				return
+			}
+		}
+	}()
+
+	// Receive responses: FileChunk messages write named files into outputDir.
+	// Using os.Create on each new file sequence so m3u8 rewrites truncate correctly.
+	openFiles := make(map[string]*os.File)
+	defer func() {
+		for _, f := range openFiles {
+			f.Close()
+		}
+	}()
+
+	var lastExitCode int32
+	var lastStderr string
+	for {
+		resp, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("recv: %w", err)
+		}
+		switch p := resp.Payload.(type) {
+		case *pb.ProcessResponse_FileChunk:
+			fc := p.FileChunk
+			name := filepath.Base(fc.Filename) // ensure basename only
+			if !fc.Eof {
+				f, ok := openFiles[name]
+				if !ok {
+					// os.Create truncates – correct for m3u8 rewrites
+					f, err = os.Create(filepath.Join(outputDir, name))
+					if err != nil {
+						return fmt.Errorf("create %s: %w", name, err)
+					}
+					openFiles[name] = f
+				}
+				if _, err := f.Write(fc.Data); err != nil {
+					return fmt.Errorf("write %s: %w", name, err)
+				}
+			} else {
+				// EOF marker: close and evict so next sequence re-creates
+				if f, ok := openFiles[name]; ok {
+					f.Close()
+					delete(openFiles, name)
+				}
+			}
+		case *pb.ProcessResponse_Result:
+			lastExitCode = p.Result.ExitCode
+			lastStderr = p.Result.Stderr
+		}
+	}
+
+	if err := <-sendErrCh; err != nil {
+		return fmt.Errorf("send: %w", err)
+	}
+
+	if lastStderr != "" {
+		fmt.Fprint(os.Stderr, lastStderr)
+	}
+	if lastExitCode != 0 {
+		os.Exit(int(lastExitCode))
+	}
+	return nil
+}
+
 func runRemote(cfg Config, args []string) error {
+	// Route HLS commands to exec mode
+	if isHLSMode(args) {
+		return runRemoteExec(cfg, args)
+	}
+
 	inputFile := detectInputFile(args)
 	outputFile := detectOutputFile(args)
 

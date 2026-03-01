@@ -9,20 +9,28 @@ service FFmpegProxy {
 
 message ProcessRequest {
   oneof payload {
-    ProcessMeta meta = 1;
-    bytes chunk = 2;
+    ProcessMeta meta = 1;   // first message: arguments + token
+    bytes chunk = 2;        // all subsequent: input data
   }
 }
 
 message ProcessMeta {
   string token = 1;
   repeated string args = 2;
+  bool exec_mode = 3;       // auto-set by client when -f hls detected
+}
+
+message FileChunk {
+  string filename = 1;      // basename only e.g. "seg0.mp4", "playlist.m3u8"
+  bytes  data     = 2;
+  bool   eof      = 3;      // last chunk of this particular file
 }
 
 message ProcessResponse {
   oneof payload {
-    bytes chunk = 1;
-    ProcessResult result = 2;
+    bytes         chunk      = 1;  // pipe mode stdout (unchanged)
+    ProcessResult result     = 2;  // final exit code + stderr (unchanged)
+    FileChunk     file_chunk = 3;  // exec mode: named file segment
   }
 }
 
