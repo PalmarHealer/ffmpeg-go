@@ -389,12 +389,15 @@ func runRemoteExec(cfg Config, args []string) error {
 		}
 	}
 
-	if err := <-sendErrCh; err != nil {
-		return fmt.Errorf("send: %w", err)
-	}
-
+	// Server's exit code takes priority: when FFmpeg fails fast the server
+	// closes the stream while we are still uploading, which makes the send
+	// goroutine return an error. That error must not mask the real exit code.
+	sendErr := <-sendErrCh
 	if lastExitCode != 0 {
 		os.Exit(int(lastExitCode))
+	}
+	if sendErr != nil {
+		return fmt.Errorf("send: %w", sendErr)
 	}
 	return nil
 }
@@ -509,13 +512,13 @@ func runRemote(cfg Config, args []string) error {
 		}
 	}
 
-	// Wait for send goroutine
-	if err := <-sendErrCh; err != nil {
-		return fmt.Errorf("send: %w", err)
-	}
-
+	// Server's exit code takes priority (same reasoning as runRemoteExec).
+	sendErr := <-sendErrCh
 	if lastExitCode != 0 {
 		os.Exit(int(lastExitCode))
+	}
+	if sendErr != nil {
+		return fmt.Errorf("send: %w", sendErr)
 	}
 	return nil
 }
