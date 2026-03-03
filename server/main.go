@@ -135,13 +135,10 @@ func (s *server) Process(stream pb.FFmpegProxy_ProcessServer) error {
 				continue
 			}
 			if _, err := stdinPipe.Write(chunk.Chunk); err != nil {
-				// FFmpeg closed stdin early; drain remaining stream bytes
-				for {
-					_, e := stream.Recv()
-					if e != nil {
-						break
-					}
-				}
+				// FFmpeg closed stdin early; stop reading input immediately.
+				// Do NOT drain – that would block for minutes on large files.
+				// The gRPC framework discards remaining incoming messages when
+				// the server-side RPC returns.
 				return
 			}
 		}
@@ -366,12 +363,7 @@ func (s *server) processExec(stream pb.FFmpegProxy_ProcessServer, args []string)
 				continue
 			}
 			if _, err := stdinPipe.Write(chunk.Chunk); err != nil {
-				for {
-					_, e := stream.Recv()
-					if e != nil {
-						break
-					}
-				}
+				// FFmpeg closed stdin early; stop reading immediately.
 				return
 			}
 		}
