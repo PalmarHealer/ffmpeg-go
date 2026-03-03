@@ -18,16 +18,18 @@ import (
 const chunkSize = 64 * 1024
 
 type Config struct {
-	ServerURL   string `json:"server_url"`
-	Token       string `json:"token"`
-	FallbackBin string `json:"fallback_bin"`
-	Fallback    string `json:"fallback"`
+	ServerURL        string `json:"server_url"`
+	Token            string `json:"token"`
+	FallbackBin      string `json:"fallback_bin"`
+	FallbackFFprobe  string `json:"fallback_ffprobe_bin"`
+	Fallback         string `json:"fallback"`
 }
 
 func defaultConfig() Config {
 	return Config{
-		FallbackBin: "ffmpeg.real",
-		Fallback:    "always",
+		FallbackBin:     "ffmpeg.real",
+		FallbackFFprobe: "ffprobe.real",
+		Fallback:        "always",
 	}
 }
 
@@ -40,6 +42,9 @@ func mergeConfig(base, overlay Config) Config {
 	}
 	if overlay.FallbackBin != "" {
 		base.FallbackBin = overlay.FallbackBin
+	}
+	if overlay.FallbackFFprobe != "" {
+		base.FallbackFFprobe = overlay.FallbackFFprobe
 	}
 	if overlay.Fallback != "" {
 		base.Fallback = overlay.Fallback
@@ -526,6 +531,8 @@ func isQueryMode(args []string) bool {
 		"-filters": true, "-pix_fmts": true, "-layouts": true,
 		"-sample_fmts": true, "-hwaccels": true, "-protocols": true,
 		"-colors": true, "-bsfs": true, "-devices": true,
+		"-h": true, "-help": true, "--help": true,
+		"-L": true, "-license": true, "-fp_format": true,
 	}
 	for _, a := range args {
 		if queryFlags[a] {
@@ -538,6 +545,14 @@ func isQueryMode(args []string) bool {
 func main() {
 	args := os.Args[1:]
 	cfg := loadConfig()
+
+	// If invoked as "ffprobe" (or via a symlink named ffprobe), always run the
+	// local ffprobe fallback. Jellyfin calls ffprobe extensively for media
+	// analysis; it must run locally since it doesn't transcode.
+	if strings.Contains(filepath.Base(os.Args[0]), "ffprobe") {
+		runFallback(cfg.FallbackFFprobe, args)
+		return
+	}
 
 	// Informational queries (e.g. Jellyfin's startup version check) must run
 	// locally via the fallback binary – they have no input file and need
