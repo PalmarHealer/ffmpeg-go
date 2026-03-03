@@ -515,9 +515,37 @@ func runRemote(cfg Config, args []string) error {
 	return nil
 }
 
+// isQueryMode returns true for informational flags that must run locally.
+// Jellyfin (and other callers) probe the binary with these at startup;
+// they carry no input file and must produce output immediately.
+func isQueryMode(args []string) bool {
+	queryFlags := map[string]bool{
+		"-version": true, "-buildconf": true,
+		"-formats": true, "-muxers": true, "-demuxers": true,
+		"-codecs": true, "-encoders": true, "-decoders": true,
+		"-filters": true, "-pix_fmts": true, "-layouts": true,
+		"-sample_fmts": true, "-hwaccels": true, "-protocols": true,
+		"-colors": true, "-bsfs": true, "-devices": true,
+	}
+	for _, a := range args {
+		if queryFlags[a] {
+			return true
+		}
+	}
+	return false
+}
+
 func main() {
 	args := os.Args[1:]
 	cfg := loadConfig()
+
+	// Informational queries (e.g. Jellyfin's startup version check) must run
+	// locally via the fallback binary – they have no input file and need
+	// an immediate response with the real ffmpeg capabilities.
+	if isQueryMode(args) {
+		runFallback(cfg.FallbackBin, args)
+		return
+	}
 
 	if cfg.ServerURL != "" {
 		err := runRemote(cfg, args)
