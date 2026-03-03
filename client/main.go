@@ -235,6 +235,14 @@ func sanitizeHLSArgs(args []string) []string {
 				i++
 				result[i] = "pipe:0"
 			}
+		case "-hls_playlist_type":
+			// "vod" delays writing the m3u8 until encoding is fully complete,
+			// so Jellyfin never sees the playlist and closes the player.
+			// "event" writes the playlist progressively as segments are encoded.
+			if i+1 < len(result) && result[i+1] == "vod" {
+				i++
+				result[i] = "event"
+			}
 		case "-hls_segment_filename":
 			if i+1 < len(result) {
 				i++
