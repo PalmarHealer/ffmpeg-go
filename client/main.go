@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -69,7 +70,34 @@ func loadConfigFile(path string) (Config, bool) {
 	return cfg, true
 }
 
+// loadEnv reads key=value pairs from a .env file in the current directory
+// and sets them as environment variables (only if not already set).
+func loadEnv() {
+	f, err := os.Open(".env")
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		val := strings.TrimSpace(parts[1])
+		if os.Getenv(key) == "" {
+			os.Setenv(key, val) //nolint:errcheck
+		}
+	}
+}
+
 func loadConfig() Config {
+	loadEnv()
 	cfg := defaultConfig()
 
 	// Priority 4 (lowest): /etc/ffmpeg-remote/config.json
@@ -94,6 +122,17 @@ func loadConfig() Config {
 	// Priority 1 (highest): ./ffmpeg-remote.json
 	if c, ok := loadConfigFile("ffmpeg-remote.json"); ok {
 		cfg = mergeConfig(cfg, c)
+	}
+
+	// Env var overrides (highest priority, set via .env or shell environment)
+	if v := os.Getenv("SERVER_URL"); v != "" {
+		cfg.ServerURL = v
+	}
+	if v := os.Getenv("TOKEN"); v != "" {
+		cfg.Token = v
+	}
+	if v := os.Getenv("DIRECT_INPUT"); strings.EqualFold(v, "true") || v == "1" {
+		cfg.DirectInput = true
 	}
 
 	return cfg
