@@ -23,6 +23,7 @@ type Config struct {
 	FallbackBin      string `json:"fallback_bin"`
 	FallbackFFprobe  string `json:"fallback_ffprobe_bin"`
 	Fallback         string `json:"fallback"`
+	DirectInput      bool   `json:"direct_input"`
 }
 
 func defaultConfig() Config {
@@ -48,6 +49,9 @@ func mergeConfig(base, overlay Config) Config {
 	}
 	if overlay.Fallback != "" {
 		base.Fallback = overlay.Fallback
+	}
+	if overlay.DirectInput {
+		base.DirectInput = true
 	}
 	return base
 }
@@ -207,13 +211,13 @@ func extractOutputDir(args []string) string {
 }
 
 // sanitizeHLSArgs transforms args for exec mode on the server:
-//   - replaces -i value with pipe:0 (strips file: URI prefix)
+//   - replaces -i value with inputReplacement (e.g. "pipe:0" or the direct path)
 //   - strips directory from -hls_segment_filename value (server uses cmd.Dir)
 //   - strips directory from -hls_fmp4_init_filename if absolute
 //   - strips directory from the final playlist argument
 //
 // Returns args with "ffmpeg" prepended as args[0].
-func sanitizeHLSArgs(args []string) []string {
+func sanitizeHLSArgs(args []string, inputReplacement string) []string {
 	result := make([]string, len(args))
 	copy(result, args)
 
@@ -233,7 +237,7 @@ func sanitizeHLSArgs(args []string) []string {
 		case "-i":
 			if i+1 < len(result) {
 				i++
-				result[i] = "pipe:0"
+				result[i] = inputReplacement
 			}
 		case "-hls_playlist_type":
 			// "vod" delays writing the m3u8 until encoding is fully complete,
@@ -284,13 +288,22 @@ func runRemoteExec(cfg Config, args []string) error {
 		return fmt.Errorf("mkdir output dir: %w", err)
 	}
 
-	// Strip file: URI prefix when opening locally
 	actualInputPath := strings.TrimPrefix(inputFile, "file:")
-	inF, err := os.Open(actualInputPath)
-	if err != nil {
-		return fmt.Errorf("open input: %w", err)
+
+	var inputReplacement string
+	var inF *os.File
+	if cfg.DirectInput {
+		// Server reads the file directly from the shared mount; send path as-is.
+		inputReplacement = actualInputPath
+	} else {
+		inputReplacement = "pipe:0"
+		var err error
+		inF, err = os.Open(actualInputPath)
+		if err != nil {
+			return fmt.Errorf("open input: %w", err)
+		}
+		defer inF.Close()
 	}
-	defer inF.Close()
 
 	conn, err := grpc.Dial(cfg.ServerURL, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -304,9 +317,9 @@ func runRemoteExec(cfg Config, args []string) error {
 		return fmt.Errorf("open stream: %w", err)
 	}
 
-	sanitized := sanitizeHLSArgs(args)
+	sanitized := sanitizeHLSArgs(args, inputReplacement)
 
-	// Send goroutine: meta first, then input file in chunks
+	// Send goroutine: meta first, then optionally stream the input file
 	sendErrCh := make(chan error, 1)
 	go func() {
 		defer stream.CloseSend()
@@ -314,13 +327,25 @@ func runRemoteExec(cfg Config, args []string) error {
 		if err := stream.Send(&pb.ProcessRequest{
 			Payload: &pb.ProcessRequest_Meta{
 				Meta: &pb.ProcessMeta{
-					Token:    cfg.Token,
-					Args:     sanitized,
-					ExecMode: true,
+					Token:           cfg.Token,
+					Args:            sanitized,
+					ExecMode:        true,
+					DirectInputPath: func() string {
+						if cfg.DirectInput {
+							return actualInputPath
+						}
+						return ""
+					}(),
 				},
 			},
 		}); err != nil {
 			sendErrCh <- err
+			return
+		}
+
+		if cfg.DirectInput {
+			// No file to stream; server reads it directly.
+			sendErrCh <- nil
 			return
 		}
 

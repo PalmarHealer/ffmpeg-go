@@ -76,7 +76,7 @@ func (s *server) Process(stream pb.FFmpegProxy_ProcessServer) error {
 
 	// Route to exec mode if requested
 	if meta.Meta.ExecMode {
-		return s.processExec(stream, args)
+		return s.processExec(stream, args, meta.Meta.DirectInputPath)
 	}
 
 	// 4. Setup context tied to stream
@@ -284,7 +284,9 @@ func sendFileToStream(send func(*pb.ProcessResponse) error, path string, sentFil
 }
 
 // processExec handles HLS / multi-file output mode.
-func (s *server) processExec(stream pb.FFmpegProxy_ProcessServer, args []string) error {
+// When directInputPath is non-empty, FFmpeg reads the input file directly from
+// that path (shared mount); no stdin pipe is created and no recv goroutine runs.
+func (s *server) processExec(stream pb.FFmpegProxy_ProcessServer, args []string, directInputPath string) error {
 	tmpDir, err := os.MkdirTemp("", "ffmpeg-exec-*")
 	if err != nil {
 		return status.Errorf(codes.Internal, "mkdirtemp: %v", err)
@@ -302,15 +304,49 @@ func (s *server) processExec(stream pb.FFmpegProxy_ProcessServer, args []string)
 
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.Dir = tmpDir
-	stdinPipe, err := cmd.StdinPipe()
-	if err != nil {
-		return status.Errorf(codes.Internal, "stdin pipe: %v", err)
+	cmd.Stdout = io.Discard
+
+	recvDone := make(chan struct{})
+	recvClientErr := make(chan error, 1)
+
+	if directInputPath != "" {
+		// Direct mode: FFmpeg opens the file itself; no stdin needed.
+		close(recvDone)
+	} else {
+		stdinPipe, err := cmd.StdinPipe()
+		if err != nil {
+			return status.Errorf(codes.Internal, "stdin pipe: %v", err)
+		}
+		// Goroutine A: recv input → stdinPipe
+		go func() {
+			defer close(recvDone)
+			defer stdinPipe.Close()
+			for {
+				req, err := stream.Recv()
+				if err == io.EOF {
+					return
+				}
+				if err != nil {
+					recvClientErr <- err
+					cancel()
+					return
+				}
+				chunk, ok := req.Payload.(*pb.ProcessRequest_Chunk)
+				if !ok {
+					continue
+				}
+				if _, err := stdinPipe.Write(chunk.Chunk); err != nil {
+					// FFmpeg closed stdin early; stop reading immediately.
+					return
+				}
+			}
+		}()
 	}
+
 	stderrPipe, err := cmd.StderrPipe()
 	if err != nil {
 		return status.Errorf(codes.Internal, "stderr pipe: %v", err)
 	}
-	cmd.Stdout = io.Discard
 
 	if err := cmd.Start(); err != nil {
 		return status.Errorf(codes.Internal, "start ffmpeg: %v", err)
@@ -338,36 +374,9 @@ func (s *server) processExec(stream pb.FFmpegProxy_ProcessServer, args []string)
 		return status.Errorf(codes.Internal, "watcher.Add: %v", err)
 	}
 
-	recvDone := make(chan struct{})
-	recvClientErr := make(chan error, 1)
 	ffmpegDone := make(chan struct{})
 	watcherDone := make(chan struct{})
 	stderrDone := make(chan struct{})
-
-	// Goroutine A: recv input → stdinPipe
-	go func() {
-		defer close(recvDone)
-		defer stdinPipe.Close()
-		for {
-			req, err := stream.Recv()
-			if err == io.EOF {
-				return
-			}
-			if err != nil {
-				recvClientErr <- err
-				cancel()
-				return
-			}
-			chunk, ok := req.Payload.(*pb.ProcessRequest_Chunk)
-			if !ok {
-				continue
-			}
-			if _, err := stdinPipe.Write(chunk.Chunk); err != nil {
-				// FFmpeg closed stdin early; stop reading immediately.
-				return
-			}
-		}
-	}()
 
 	// Goroutine B: watcher relay → safeSend(FileChunk)
 	sentFiles := make(map[string]bool)

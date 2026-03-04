@@ -17,7 +17,8 @@ message ProcessRequest {
 message ProcessMeta {
   string token = 1;
   repeated string args = 2;
-  bool exec_mode = 3;       // auto-set by client when -f hls detected
+  bool exec_mode = 3;            // auto-set by client when -f hls detected
+  string direct_input_path = 4; // server reads input from this path directly (shared mount)
 }
 
 message FileChunk {
